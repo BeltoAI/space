@@ -1,4 +1,4 @@
-import type { VisionScores, FrameAnalysis } from './types';
+import type { VisionScores, FrameAnalysis, SourceMode } from './types';
 import { runInference, cosineSimilarity } from './model';
 import {
   findConnectedComponents,
@@ -12,7 +12,7 @@ import {
 import { log } from './logs';
 import { classifyScene } from './eurosat-runtime';
 
-const MAX_DIM = 384;  // Smaller working size — k-means is O(N*K*iterations)
+const MAX_DIM = 384;
 
 type DrawSource = HTMLImageElement | HTMLCanvasElement | HTMLVideoElement;
 
@@ -40,50 +40,31 @@ function clamp01(x: number): number {
   return Math.max(0, Math.min(1, Number(x.toFixed(3))));
 }
 
-// ============================================================
-// LAB color space — perceptually uniform, where Euclidean distance
-// roughly matches how different two colors look. Critical for clustering.
-// ============================================================
+// LAB color space — perceptually uniform.
 function rgbToLab(r: number, g: number, b: number): [number, number, number] {
-  // Normalize 0-1
   let R = r / 255, G = g / 255, B = b / 255;
-  // sRGB → linear
   R = R > 0.04045 ? Math.pow((R + 0.055) / 1.055, 2.4) : R / 12.92;
   G = G > 0.04045 ? Math.pow((G + 0.055) / 1.055, 2.4) : G / 12.92;
   B = B > 0.04045 ? Math.pow((B + 0.055) / 1.055, 2.4) : B / 12.92;
-  // RGB → XYZ (D65)
   let X = (R * 0.4124564 + G * 0.3575761 + B * 0.1804375) / 0.95047;
   let Y = (R * 0.2126729 + G * 0.7151522 + B * 0.0721750) / 1.00000;
   let Z = (R * 0.0193339 + G * 0.1191920 + B * 0.9503041) / 1.08883;
-  // XYZ → LAB
   const f = (t: number) => t > 0.008856 ? Math.cbrt(t) : (7.787 * t + 16 / 116);
   const fx = f(X), fy = f(Y), fz = f(Z);
-  return [
-    116 * fy - 16,        // L: 0..100
-    500 * (fx - fy),      // a: roughly -128..+127 (green-red)
-    200 * (fy - fz)       // b: roughly -128..+127 (blue-yellow)
-  ];
+  return [116 * fy - 16, 500 * (fx - fy), 200 * (fy - fz)];
 }
 
-// ============================================================
-// K-means clustering in LAB space.
-// Returns cluster assignments (per-pixel cluster ID) and centroids.
-// ============================================================
 interface KMeansResult {
-  assignments: Uint8Array;          // pixel → cluster ID
-  centroids: number[][];            // [L, a, b, R, G, B] per cluster
-  clusterSizes: number[];           // pixel count per cluster
+  assignments: Uint8Array;
+  centroids: number[][];      // [L, a, b, R, G, B] per cluster
+  clusterSizes: number[];
 }
 
 function kmeans(lab: Float32Array, rgb: Uint8ClampedArray, N: number, K: number, maxIters = 8): KMeansResult {
-  // k-means++ initialization for stability
   const centroids: number[][] = [];
-  // First centroid: random pixel
   const firstIdx = Math.floor(Math.random() * N);
   centroids.push([lab[firstIdx * 3], lab[firstIdx * 3 + 1], lab[firstIdx * 3 + 2]]);
 
-  // Subsequent centroids: weighted by squared distance to nearest existing centroid
-  // Sample subset for speed
   const sampleStride = Math.max(1, Math.floor(N / 4000));
   for (let k = 1; k < K; k++) {
     let totalDist = 0;
@@ -102,7 +83,6 @@ function kmeans(lab: Float32Array, rgb: Uint8ClampedArray, N: number, K: number,
       samples.push(i);
       totalDist += minD;
     }
-    // Pick weighted random
     let r = Math.random() * totalDist;
     let chosen = samples[0];
     for (let j = 0; j < dists.length; j++) {
@@ -116,7 +96,6 @@ function kmeans(lab: Float32Array, rgb: Uint8ClampedArray, N: number, K: number,
   let prevTotalShift = Infinity;
 
   for (let iter = 0; iter < maxIters; iter++) {
-    // Assignment step
     for (let i = 0; i < N; i++) {
       const lL = lab[i * 3], lA = lab[i * 3 + 1], lB = lab[i * 3 + 2];
       let bestK = 0;
@@ -131,8 +110,6 @@ function kmeans(lab: Float32Array, rgb: Uint8ClampedArray, N: number, K: number,
       }
       assignments[i] = bestK;
     }
-
-    // Update step
     const sums = Array.from({ length: K }, () => [0, 0, 0]);
     const counts = new Array(K).fill(0);
     for (let i = 0; i < N; i++) {
@@ -154,12 +131,10 @@ function kmeans(lab: Float32Array, rgb: Uint8ClampedArray, N: number, K: number,
       totalShift += Math.sqrt(dL * dL + dA * dA + dB * dB);
       centroids[k] = [newL, newA, newB];
     }
-    // Early termination if converged
     if (Math.abs(prevTotalShift - totalShift) < 0.5) break;
     prevTotalShift = totalShift;
   }
 
-  // Compute mean RGB per cluster (for semantic mapping + viz)
   const rgbSums = Array.from({ length: K }, () => [0, 0, 0]);
   const counts = new Array(K).fill(0);
   for (let i = 0; i < N; i++) {
@@ -182,38 +157,154 @@ function kmeans(lab: Float32Array, rgb: Uint8ClampedArray, N: number, K: number,
 }
 
 // ============================================================
-// Map a cluster centroid to a semantic class.
-// Uses LAB + mean RGB. This is a single decision per cluster (not per pixel),
-// so even if the centroid is slightly off, ALL pixels in that cluster get the
-// same correct label — making the segmentation visually coherent.
+// Scene context — computed AFTER k-means so we can validate cluster
+// classifications against the broader image. This is the key fix for
+// "person holding red phone = FIRE": fire requires the scene to contain
+// natural elements (vegetation/terrain/cloud), not just a red blob in a
+// uniform background.
 // ============================================================
-function clusterToClass(L: number, _a: number, _b: number, R: number, G: number, B: number): number {
+interface SceneContext {
+  /** % of image that is dark + neutral (sky, space, dark indoor backgrounds) */
+  darkNeutralFrac: number;
+  /** % that is bright (clouds, walls, highlights) */
+  brightFrac: number;
+  /** Mean L of all pixels */
+  meanL: number;
+  /** Std-dev of L — high in night satellite scenes (dark + city lights) */
+  stdL: number;
+  /** Histogram bimodality estimate — flag city lights / mirror selfies */
+  bimodality: number;
+  /** Fraction of pixels with any warm content (r > g, r > b) — low for night satellite, high for fire scenes */
+  warmFrac: number;
+  /** Fraction of pixels with strongly saturated green (vegetation in SWIR/false-color)
+   *  — high in MODIS bands 7-2-1 imagery, near zero in indoor photos */
+  saturatedGreenFrac: number;
+}
+
+function computeSceneContext(lab: Float32Array, data: Uint8ClampedArray, N: number): SceneContext {
+  let sumL = 0, sumLsq = 0;
+  let darkNeutral = 0, bright = 0, warm = 0, satGreen = 0;
+  const lumHist = new Uint32Array(256);
+  for (let i = 0; i < N; i++) {
+    const L = lab[i * 3];
+    const a = lab[i * 3 + 1];
+    const b = lab[i * 3 + 2];
+    sumL += L;
+    sumLsq += L * L;
+    if (L < 30 && Math.abs(a) < 8 && Math.abs(b) < 8) darkNeutral++;
+    if (L > 75) bright++;
+    const v = Math.min(255, Math.max(0, Math.round(L * 2.55)));
+    lumHist[v]++;
+    const idx = i * 4;
+    const r = data[idx], g = data[idx + 1], bl = data[idx + 2];
+    if (r > 130 && r > g && r > bl) warm++;
+    // Strongly saturated green: vegetation in SWIR false-color is bright
+    // & green-dominant. In bands 7-2-1, vegetation pixels look like (50, 200, 30)
+    // where green wildly dominates. This fingerprints SWIR imagery and
+    // distinguishes it from indoor/portrait photos which never have such
+    // strong green dominance.
+    if (g > 130 && g > r + 30 && g > bl + 30) satGreen++;
+  }
+  const meanL = sumL / N;
+  const stdL = Math.sqrt(Math.max(0, sumLsq / N - meanL * meanL));
+
+  let darkPeakC = 0, brightPeakC = 0;
+  for (let v = 0; v < 80; v++) {
+    if (lumHist[v] > darkPeakC) darkPeakC = lumHist[v];
+  }
+  for (let v = 180; v < 256; v++) {
+    if (lumHist[v] > brightPeakC) brightPeakC = lumHist[v];
+  }
+  const minPeak = Math.min(darkPeakC, brightPeakC);
+  const maxPeak = Math.max(darkPeakC, brightPeakC);
+  const bimodality = maxPeak > 0 ? minPeak / maxPeak : 0;
+
+  return {
+    darkNeutralFrac: darkNeutral / N,
+    brightFrac: bright / N,
+    meanL,
+    stdL,
+    bimodality,
+    warmFrac: warm / N,
+    saturatedGreenFrac: satGreen / N
+  };
+}
+
+// ============================================================
+// Cluster → semantic class. NOW takes scene context to reject
+// false positives that wreck the demo:
+//
+// - Red phone case in webcam: cluster is fire-colored BUT the scene has
+//   high darkNeutralFrac (indoor) and low brightFrac (no sky). Fire rejected.
+// - City lights at night satellite: bright spots in dark scene have high
+//   bimodality. Water rule rejects (water is large coherent dark-blue regions,
+//   not sparse hot points).
+// - Snow/ice in storm scene: cluster has L>70 and very neutral a*b*. Looks
+//   like terrain to old rule. Tighten: terrain MUST have warm a* (>2).
+// ============================================================
+function clusterToClass(
+  L: number, a: number, b: number,
+  R: number, G: number, B: number,
+  ctx: SceneContext,
+  sourceMode: SourceMode
+): number {
   const maxC = Math.max(R, G, B);
   const minC = Math.min(R, G, B);
   const sat = maxC === 0 ? 0 : (maxC - minC) / maxC;
 
-  // FIRE — saturated red/orange. Centroid-level test is much more reliable
-  // than per-pixel because k-means groups all warm pixels together.
-  if (R > 170 && R > G + 30 && R > B + 50 && sat > 0.40 && L > 35 && L < 85) {
-    return CLASS_FIRE;
+  // FIRE — extra strict for webcam (where false positives are most common)
+  // Fire requires:
+  //   - Saturated red/orange centroid
+  //   - For satellite/upload: scene must NOT be dominated by neutral indoor
+  //     background (typical mirror selfie). meanL < 35 = scene is mostly dark
+  //     (could be burnt ground in a fire image — allow). meanL > 50 with high
+  //     darkNeutralFrac = indoor scene with red object — reject.
+  //   - For webcam: NEVER trigger fire from RGB alone. Webcam fire detection
+  //     would need thermal IR. Red objects in webcam are red objects, not fires.
+  if (sourceMode !== 'webcam') {
+    if (R > 170 && R > G + 30 && R > B + 50 && sat > 0.40 && L > 35 && L < 85) {
+      // looksIndoor: bright + neutral scene with no satellite signature.
+      // Bypassed for SWIR satellite scenes (high saturatedGreenFrac fingerprints
+      // bands 7-2-1 imagery — vegetation lights up bright green there).
+      const isSwirSatellite = ctx.saturatedGreenFrac > 0.10;
+      const looksIndoor = !isSwirSatellite && ctx.meanL > 50 && ctx.brightFrac > 0.20;
+      const isNightSatellite = ctx.meanL < 30 && ctx.brightFrac < 0.15 && ctx.warmFrac < 0.10;
+      if (!looksIndoor && !isNightSatellite) {
+        return CLASS_FIRE;
+      }
+    }
   }
+
   // CLOUD — bright + desaturated + neutral or slightly cool
   if (L > 75 && sat < 0.18 && B >= R - 8) {
     return CLASS_CLOUD;
   }
+
   // WATER — dark + blue dominant
-  if (L < 45 && B > R + 5 && B > G - 5) {
-    return CLASS_WATER;
+  if (sourceMode !== 'webcam') {
+    const isNightSatellite = ctx.meanL < 30 && ctx.brightFrac < 0.15 && ctx.warmFrac < 0.10;
+    if (!isNightSatellite && L < 45 && B > R + 5 && B > G - 5 && b < -3) {
+      return CLASS_WATER;
+    }
   }
-  // VEGETATION — green dominant
-  if (G > R + 5 && G > B + 8 && L > 25 && L < 75) {
+
+  // VEGETATION — green dominant. Safe across all modes (green plants exist).
+  if (G > R + 5 && G > B + 8 && L > 25 && L < 75 && a < -5) {
     return CLASS_VEGETATION;
   }
-  // TERRAIN — warm/desaturated land (everything else that's not too dark/bright)
-  if (L > 35 && L < 80 && sat > 0.05 && R >= B - 5) {
+
+  // TERRAIN — warm/desaturated land.
+  // CRITICAL FIX: require positive a* (warm) AND positive b* (yellow-ish).
+  // This excludes blue-white snow/ice clouds that were getting labeled terrain.
+  // For webcam: relax somewhat since indoor walls/skin tones have similar stats.
+  if (sourceMode === 'webcam') {
+    // Webcam: don't label terrain at all. There's nothing useful about it.
+    return CLASS_BG;
+  }
+  if (L > 35 && L < 80 && sat > 0.05 && a > 2 && b > 5 && R >= B - 5) {
     return CLASS_TERRAIN;
   }
-  // Reject — leave unclassified
+
   return CLASS_BG;
 }
 
@@ -223,12 +314,11 @@ export interface SpectralResult {
   mask: Uint8Array;
 }
 
-export function spectralAnalysis(imageData: ImageData): SpectralResult {
+export function spectralAnalysis(imageData: ImageData, sourceMode: SourceMode = 'satellite'): SpectralResult {
   const t0 = performance.now();
   const { data, width: W, height: H } = imageData;
   const N = W * H;
 
-  // 1) Convert to LAB
   const lab = new Float32Array(N * 3);
   for (let i = 0; i < N; i++) {
     const idx = i * 4;
@@ -238,32 +328,57 @@ export function spectralAnalysis(imageData: ImageData): SpectralResult {
     lab[i * 3 + 2] = b;
   }
 
-  // 2) K-means cluster in LAB. K=8 is a sweet spot — enough to separate
-  // sky/cloud/water/grass/terrain/fire/shadow/etc, not so many that small
-  // patches get over-segmented.
+  // Compute scene-level context first
+  const ctx = computeSceneContext(lab, data, N);
+
   const K = 8;
   const km = kmeans(lab, data, N, K, 8);
 
-  // 3) Map each cluster to a semantic class based on its centroid color.
+  // Map clusters to classes using scene context + source mode
   const clusterClass = new Uint8Array(K);
   for (let k = 0; k < K; k++) {
     const c = km.centroids[k];
-    clusterClass[k] = clusterToClass(c[0], c[1], c[2], c[3], c[4], c[5]);
+    clusterClass[k] = clusterToClass(c[0], c[1], c[2], c[3], c[4], c[5], ctx, sourceMode);
   }
 
-  // 4) Build per-pixel mask using cluster → class assignment.
-  // This gives perfectly coherent regions because all pixels in a cluster
-  // get the SAME class — the "patchy" look from per-pixel thresholding is gone.
   const mask = new Uint8Array(N);
   for (let i = 0; i < N; i++) {
     mask[i] = clusterClass[km.assignments[i]];
   }
 
-  // 5) Compute scores from cluster sizes (already counted during k-means)
+  // PER-PIXEL FIRE OVERRIDE — k-means clusters can dilute small fire regions
+  // into terrain-colored centroids. Run a strict per-pixel hot-pixel detector
+  // and force any matching pixels to FIRE class. This catches sparse fires
+  // that get washed out by cluster averaging.
+  // Skip for webcam mode entirely. Skip for indoor-looking scenes (high
+  // meanL + high brightFrac = mid-bright photo, not a fire scene).
+  if (sourceMode !== 'webcam') {
+    const isSwirSatellite = ctx.saturatedGreenFrac > 0.10;
+    const looksIndoor = !isSwirSatellite && ctx.meanL > 50 && ctx.brightFrac > 0.20;
+    const isNightSatellite = ctx.meanL < 30 && ctx.brightFrac < 0.15 && ctx.warmFrac < 0.10;
+    if (!looksIndoor && !isNightSatellite) {
+      for (let i = 0; i < N; i++) {
+        const idx = i * 4;
+        const r = data[idx], g = data[idx + 1], b = data[idx + 2];
+        const maxC = Math.max(r, g, b), minC = Math.min(r, g, b);
+        const sat = maxC === 0 ? 0 : (maxC - minC) / maxC;
+        // Bright + warm + saturated. Real fire pixels are R=255 with G/B
+        // dropping off. Threshold 0.35 catches both bright fires and
+        // slightly-orange flame tones; r>g+40 and r>b+70 keeps it specific.
+        if (r > 200 && r > g + 40 && r > b + 70 && sat > 0.35) {
+          mask[i] = CLASS_FIRE;
+        }
+      }
+    }
+  }
+
+  // Compute final class areas from the mask (which includes the per-pixel
+  // fire override). This is critical: if we computed scores from cluster
+  // sizes, the per-pixel fire pixels would be miscounted as their original
+  // cluster's class.
   const classArea: Record<number, number> = {};
-  for (let k = 0; k < K; k++) {
-    const cls = clusterClass[k];
-    classArea[cls] = (classArea[cls] ?? 0) + km.clusterSizes[k];
+  for (let i = 0; i < N; i++) {
+    classArea[mask[i]] = (classArea[mask[i]] ?? 0) + 1;
   }
 
   const fire       = clamp01(((classArea[CLASS_FIRE]       ?? 0) / N) * 4);
@@ -311,9 +426,10 @@ function sobelDensity(lum: Float32Array, w: number, h: number): number {
 export async function analyzeFrame(
   imageData: ImageData,
   prevEmbedding: Float32Array | null,
-  minDetectionArea = 400
+  minDetectionArea = 600,
+  sourceMode: SourceMode = 'satellite'
 ): Promise<FrameAnalysis> {
-  const spectral = spectralAnalysis(imageData);
+  const spectral = spectralAnalysis(imageData, sourceMode);
 
   let embedding: Float32Array | null = null;
   let inferenceMs = 0;
@@ -341,7 +457,9 @@ export async function analyzeFrame(
     minDetectionArea
   );
 
-  const sceneResult = await classifyScene(imageData);
+  // Only run scene classifier on satellite/upload — running EuroSAT on webcam
+  // would predict garbage classes anyway since training was on Sentinel-2
+  const sceneResult = sourceMode !== 'webcam' ? await classifyScene(imageData) : null;
   const scene = sceneResult
     ? {
         topClass: sceneResult.topClass,
@@ -362,6 +480,7 @@ export async function analyzeFrame(
     detections: cc.detections,
     detectionLabels: cc.labels,
     sourceImageData: imageData,
-    scene
+    scene,
+    sourceMode
   };
 }

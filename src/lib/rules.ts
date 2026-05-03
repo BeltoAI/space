@@ -1,12 +1,12 @@
-import type { VisionScores, RuleResult, SceneInfo } from './types';
+import type { VisionScores, RuleResult, SceneInfo, SourceMode } from './types';
 
 export interface RuleContext {
   scores: VisionScores;
   scene?: SceneInfo | null;
   degradedNetwork: boolean;
+  sourceMode: SourceMode;
 }
 
-// Aggregate scene-level water probability (River + SeaLake)
 function waterProb(scene: SceneInfo): number {
   let p = 0;
   for (const t of scene.top3) {
@@ -15,7 +15,6 @@ function waterProb(scene: SceneInfo): number {
   return p;
 }
 
-// Aggregate developed/anthropogenic
 function developedProb(scene: SceneInfo): number {
   let p = 0;
   for (const t of scene.top3) {
@@ -25,12 +24,59 @@ function developedProb(scene: SceneInfo): number {
 }
 
 export function evaluate(ctx: RuleContext): RuleResult {
-  const { scores, scene, degradedNetwork } = ctx;
+  const { scores, scene, degradedNetwork, sourceMode } = ctx;
   let result: RuleResult;
 
-  // FIRE — strict spectral signature; same as before. Scene classifier
-  // doesn't have a "fire" class, so we keep the spectral check.
-  if (scores.fire >= 0.06) {
+  // ============================================================
+  // WEBCAM MODE — completely separate decision track.
+  // Webcam frames are NOT satellite tiles. Don't trigger fire response,
+  // flood watch, or cloud-occlusion rules. Instead, route based on the
+  // CNN's anomaly signal (frame-to-frame change) — this is what's
+  // actually impressive in webcam mode: real-time edge inference + change
+  // detection running fully on the laptop.
+  // ============================================================
+  if (sourceMode === 'webcam') {
+    if (scores.anomaly >= 0.35) {
+      result = {
+        rule: 'EDGE_ANOMALY',
+        priority: 'HIGH',
+        decision: 'COMPRESSED_DOWNLINK',
+        reason: `frame-to-frame change detected (anomaly=${scores.anomaly.toFixed(2)})`,
+        action: 'COMPRESSED DOWNLINK · scene change'
+      };
+    } else if (scores.activity >= 0.20) {
+      result = {
+        rule: 'EDGE_ACTIVE',
+        priority: 'LOW',
+        decision: 'EVENT_DOWNLINK',
+        reason: `edge node active · CNN inference + change detection running locally`,
+        action: 'EDGE PROCESSING · routine telemetry'
+      };
+    } else {
+      result = {
+        rule: 'EDGE_IDLE',
+        priority: 'LOW',
+        decision: 'DISCARD_ONBOARD',
+        reason: `edge node idle · no scene change detected`,
+        action: 'DISCARD · no event'
+      };
+    }
+    if (degradedNetwork && result.priority !== 'CRITICAL') {
+      return {
+        rule: 'DEGRADED_NETWORK_OVERRIDE',
+        priority: 'LOW',
+        decision: 'DISCARD_ONBOARD',
+        reason: `degraded network mode suppresses non-critical (origin: ${result.rule})`,
+        action: 'DISCARD · suppressed in degraded mode'
+      };
+    }
+    return result;
+  }
+
+  // ============================================================
+  // SATELLITE / UPLOAD MODE — full mission rule engine
+  // ============================================================
+  if (scores.fire >= 0.025) {
     result = {
       rule: 'PRIORITY_FIRE',
       priority: 'CRITICAL',
@@ -39,7 +85,6 @@ export function evaluate(ctx: RuleContext): RuleResult {
       action: 'DOWNLINK NOW · alert fire response'
     };
   }
-  // ANOMALY (video mode)
   else if (scores.anomaly >= 0.50) {
     result = {
       rule: 'ANOMALY_REPORT',
@@ -49,7 +94,6 @@ export function evaluate(ctx: RuleContext): RuleResult {
       action: 'COMPRESSED DOWNLINK · flag for review'
     };
   }
-  // SCENE-DRIVEN routing — when classifier is loaded, prefer it over RGB heuristics
   else if (scene && scene.confidence >= 0.45) {
     const w = waterProb(scene);
     const d = developedProb(scene);
@@ -71,7 +115,6 @@ export function evaluate(ctx: RuleContext): RuleResult {
         action: 'EVENT DOWNLINK · catalog developed scene'
       };
     } else {
-      // Forest, vegetation, agriculture etc. — natural baseline, low value
       result = {
         rule: 'NATURAL_BASELINE',
         priority: 'LOW',
@@ -81,27 +124,25 @@ export function evaluate(ctx: RuleContext): RuleResult {
       };
     }
   }
-  // FALLBACK — when classifier not loaded or low-confidence, use heuristic scores
-  else if (scores.water >= 0.45) {
-    result = {
-      rule: 'FLOOD_WATCH',
-      priority: 'HIGH',
-      decision: 'COMPRESSED_DOWNLINK',
-      reason: `large water signature (water=${scores.water.toFixed(2)})`,
-      action: 'COMPRESSED DOWNLINK · notify hydro response'
-    };
-  } else if (
-    scores.cloud >= 0.55 &&
-    scores.fire < 0.05 &&
-    scores.water < 0.20 &&
-    scores.vegetation < 0.15
-  ) {
+  // CLOUD_DISCARD comes BEFORE FLOOD_WATCH — many cloud-heavy scenes have
+  // small dark patches that get misread as water otherwise.
+  else if (scores.cloud >= 0.45 && scores.fire < 0.05) {
     result = {
       rule: 'CLOUD_DISCARD',
       priority: 'LOW',
       decision: 'DISCARD_ONBOARD',
       reason: `scene occluded by cloud (cloud=${scores.cloud.toFixed(2)})`,
       action: 'DISCARD · cloud-occluded'
+    };
+  }
+  else if (scores.water >= 0.55) {
+    // Large coherent water region — could be ocean, large lake, or flooding event
+    result = {
+      rule: 'WATER_BODY',
+      priority: 'HIGH',
+      decision: 'COMPRESSED_DOWNLINK',
+      reason: `large water signature (water=${scores.water.toFixed(2)})`,
+      action: 'COMPRESSED DOWNLINK · catalog water body'
     };
   } else {
     result = {

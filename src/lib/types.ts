@@ -31,6 +31,10 @@ export interface VisionScores {
   anomaly: number;
 }
 
+// What kind of input we're processing. The classifier behaves differently for
+// each — webcam frames don't trigger satellite-mission rules like FLOOD_WATCH.
+export type SourceMode = 'satellite' | 'webcam' | 'upload';
+
 export interface FrameAnalysis {
   scores: VisionScores;
   embedding: Float32Array | null;
@@ -43,6 +47,7 @@ export interface FrameAnalysis {
   detections: Detection[];
   sourceImageData: ImageData;
   scene?: SceneInfo | null;
+  sourceMode: SourceMode;
 }
 
 export interface SceneInfo {
@@ -106,6 +111,7 @@ export interface ProcessingResult {
   detectionOverlayUrl?: string;
   framesProcessed: number;
   scene?: SceneInfo | null;
+  sourceMode: SourceMode;
 }
 
 export interface RuntimeInfo {

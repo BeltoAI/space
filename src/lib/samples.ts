@@ -3,49 +3,71 @@ import { log } from './logs';
 export interface Sample {
   id: string;
   label: string;
-  lat: number;
-  lon: number;
-  date: string;
-  layer: string;
   caption: string;
+  /** Either a GIBS satellite tile or a bundled local asset */
+  kind: 'gibs' | 'local';
+  /** GIBS-only fields */
+  lat?: number;
+  lon?: number;
+  z?: number;
+  date?: string;
+  layer?: string;
+  /** Local-only field — path under /public */
+  url?: string;
 }
 
+// ============================================================
+// CURATED DEMO SAMPLES
+//
+// Mix of two source types:
+//   1. GIBS satellite tiles — real MODIS Terra imagery, fetched at runtime
+//   2. Local bundled assets — guaranteed-dramatic illustrations bundled in
+//      the build, no fetch dependency
+//
+// The wildfire sample uses a bundled illustration so the demo can ALWAYS
+// show a clear, unambiguous fire — the YC viewer instantly sees "fire"
+// without satellite acquisition gambling.
+// ============================================================
 export const SAMPLES: Sample[] = [
   {
-    id: 'fire',
-    label: 'Park Fire 2024 (CA)',
-    lat: 40.0,
-    lon: -121.6,
-    date: '2024-07-26',
-    layer: 'MODIS_Terra_CorrectedReflectance_TrueColor',
-    caption: 'Park Fire, California — peak smoke plume'
+    id: 'wildfire',
+    kind: 'local',
+    label: 'Wildfire — forest fire (USFS)',
+    caption: 'Active flame front engulfing pine forest',
+    url: '/samples/wildfire.jpg'
   },
   {
-    id: 'cloud',
-    label: 'Storm system (N. Atlantic)',
-    lat: 55.0,
+    id: 'storm',
+    kind: 'gibs',
+    label: 'Hurricane Helene — Florida landfall',
+    caption: 'Cat-4 hurricane spiral · 2024-09-26',
+    lat: 28.0,
+    lon: -83.0,
+    z: 5,
+    date: '2024-09-26',
+    layer: 'MODIS_Terra_CorrectedReflectance_TrueColor'
+  },
+  {
+    id: 'storm-atlantic',
+    kind: 'gibs',
+    label: 'Storm system — North Atlantic',
+    caption: 'Dense cloud cover over open ocean',
+    lat: 50.0,
     lon: -30.0,
-    date: '2024-09-15',
-    layer: 'MODIS_Terra_CorrectedReflectance_TrueColor',
-    caption: 'North Atlantic dense storm clouds'
+    z: 5,
+    date: '2024-10-10',
+    layer: 'MODIS_Terra_CorrectedReflectance_TrueColor'
   },
   {
-    id: 'water',
-    label: 'Open water (Mediterranean)',
-    lat: 36.0,
-    lon: 17.0,
-    date: '2024-07-10',
-    layer: 'MODIS_Terra_CorrectedReflectance_TrueColor',
-    caption: 'Central Mediterranean Sea, clear sky'
-  },
-  {
-    id: 'terrain',
-    label: 'Clear terrain (Sahara)',
+    id: 'desert',
+    kind: 'gibs',
+    label: 'Sahara — clear desert',
+    caption: 'Cloud-free arid terrain · low value scene',
     lat: 23.0,
     lon: 12.0,
+    z: 5,
     date: '2024-06-15',
-    layer: 'MODIS_Terra_CorrectedReflectance_TrueColor',
-    caption: 'Central Sahara, cloud-free desert'
+    layer: 'MODIS_Terra_CorrectedReflectance_TrueColor'
   }
 ];
 
@@ -68,6 +90,58 @@ function shiftDate(d: string, days: number): string {
   return dt.toISOString().slice(0, 10);
 }
 
+async function fetchLocalSample(sample: Sample): Promise<{ url: string; rawBytes: number }> {
+  const url = sample.url!;
+  await log.streamed(`fetching sample: ${sample.label}`, 'info', 30);
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`local sample missing: ${url}`);
+  const blob = await res.blob();
+  const objUrl = URL.createObjectURL(blob);
+  await log.streamed(
+    `loaded bundled asset: ${(blob.size / 1024).toFixed(1)} KB · ${url}`,
+    'ok',
+    30
+  );
+  return { url: objUrl, rawBytes: blob.size };
+}
+
+async function fetchGibsSample(sample: Sample): Promise<{ url: string; rawBytes: number }> {
+  const { x, y } = lonLatToTileXY(sample.lon!, sample.lat!, sample.z!);
+  await log.streamed(`fetching sample: ${sample.label}`, 'info', 30);
+
+  const dateAttempts = [
+    sample.date!,
+    shiftDate(sample.date!, -1),
+    shiftDate(sample.date!, 1),
+    shiftDate(sample.date!, -2),
+    shiftDate(sample.date!, 2)
+  ];
+
+  let blob: Blob | null = null;
+  let usedDate = sample.date!;
+  for (const d of dateAttempts) {
+    const url = `https://gibs.earthdata.nasa.gov/wmts/epsg4326/best/${sample.layer}/default/${d}/250m/${sample.z}/${y}/${x}.jpg`;
+    try {
+      const res = await fetch(url);
+      if (!res.ok) continue;
+      const b = await res.blob();
+      if (b.size < 4000) continue;
+      blob = b;
+      usedDate = d;
+      break;
+    } catch {}
+  }
+  if (!blob) throw new Error(`GIBS tile unavailable for ${sample.label}`);
+
+  const url = URL.createObjectURL(blob);
+  await log.streamed(
+    `tile fetched: ${(blob.size / 1024).toFixed(1)} KB · ${usedDate}`,
+    'ok',
+    30
+  );
+  return { url, rawBytes: blob.size };
+}
+
 export async function getSampleTile(
   id: string
 ): Promise<{ url: string; rawBytes: number; sample: Sample }> {
@@ -77,34 +151,10 @@ export async function getSampleTile(
   const cached = cache.get(id);
   if (cached) return { ...cached, sample };
 
-  const z = 6;
-  const { x, y } = lonLatToTileXY(sample.lon, sample.lat, z);
-  await log.streamed(`fetching sample: ${sample.label}`, 'info', 30);
+  const result = sample.kind === 'local'
+    ? await fetchLocalSample(sample)
+    : await fetchGibsSample(sample);
 
-  const dateAttempts = [
-    sample.date,
-    shiftDate(sample.date, -1),
-    shiftDate(sample.date, -2),
-    shiftDate(sample.date, 1),
-    shiftDate(sample.date, 2)
-  ];
-
-  let blob: Blob | null = null;
-  for (const d of dateAttempts) {
-    const url = `https://gibs.earthdata.nasa.gov/wmts/epsg4326/best/${sample.layer}/default/${d}/250m/${z}/${y}/${x}.jpg`;
-    try {
-      const res = await fetch(url);
-      if (!res.ok) continue;
-      blob = await res.blob();
-      break;
-    } catch {}
-  }
-  if (!blob) throw new Error(`GIBS tile unavailable for ${sample.label}`);
-
-  const url = URL.createObjectURL(blob);
-  await log.streamed(`tile fetched: ${(blob.size / 1024).toFixed(1)} KB`, 'ok', 30);
-
-  const result = { url, rawBytes: blob.size };
   cache.set(id, result);
   return { ...result, sample };
 }

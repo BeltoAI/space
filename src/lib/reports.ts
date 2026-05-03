@@ -1,6 +1,6 @@
 import type { DownlinkPayload, VisionScores, RuleResult, Telemetry, Detection, SceneInfo } from './types';
 
-const VERSION = '0.11.0';
+const VERSION = '0.19.0';
 
 export function buildTelemetry(): Telemetry {
   const now = new Date();

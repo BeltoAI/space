@@ -25,7 +25,7 @@ import {
   captureWebcamFrame,
   paintToCanvas
 } from './lib/webcam';
-import type { ProcessingResult, RuntimeInfo } from './lib/types';
+import type { ProcessingResult, RuntimeInfo, SourceMode } from './lib/types';
 
 const STREAM_INTERVAL_MS = 30_000;
 const WEBCAM_INTERVAL_MS = 1000;
@@ -72,18 +72,28 @@ export default function App() {
     id: ImageData,
     rawBytes: number,
     sourceLabel: string,
-    silent = false
+    silent = false,
+    sourceMode: SourceMode = 'satellite'
   ) {
     const t0 = performance.now();
-    const fa = await analyzeFrame(id, null);
+    const fa = await analyzeFrame(id, null, 400, sourceMode);
 
-    const rule = evaluate({ scores: fa.scores, scene: fa.scene, degradedNetwork: false });
+    const rule = evaluate({ scores: fa.scores, scene: fa.scene, degradedNetwork: false, sourceMode });
 
     const detectionOverlayUrl = await renderDetectionOverlay(
       fa.sourceImageData,
       fa.detectionMask,
       fa.detections,
-      { maxLabels: 6, labels: fa.detectionLabels, imageW: fa.width, imageH: fa.height }
+      {
+        maxLabels: 6,
+        labels: fa.detectionLabels,
+        imageW: fa.width,
+        imageH: fa.height,
+        // Don't render terrain/vegetation contours — they're the most common
+        // false-positive class and add visual noise. Fire/cloud/water are
+        // the mission-relevant classes worth highlighting.
+        excludeClasses: ['terrain', 'vegetation']
+      }
     );
 
     const includesThumb =
@@ -147,7 +157,8 @@ export default function App() {
       thumbnailDataUrl,
       detectionOverlayUrl,
       framesProcessed: 1,
-      scene: fa.scene
+      scene: fa.scene,
+      sourceMode
     });
 
     return rule;
@@ -157,7 +168,8 @@ export default function App() {
     url: string,
     forceRawBytes: number | undefined,
     sourceLabel: string,
-    silent = false
+    silent = false,
+    sourceMode: SourceMode = 'satellite'
   ) {
     const img = await loadImage(url);
     const rawBytes = forceRawBytes ?? (await estimateBytes(url));
@@ -165,7 +177,7 @@ export default function App() {
       log.emit(`raw input: ${img.naturalWidth}x${img.naturalHeight} · ${formatBytes(rawBytes)}`, 'info');
     }
     const id = imageToImageData(img);
-    await processImageData(id, rawBytes, sourceLabel, silent);
+    await processImageData(id, rawBytes, sourceLabel, silent, sourceMode);
   }
 
   async function processVideoUrl(url: string, isTimelapse: boolean) {
@@ -188,7 +200,7 @@ export default function App() {
     }
 
     const best = videoResult.bestFrame;
-    const rule = evaluate({ scores: best.scores, scene: best.scene, degradedNetwork: false });
+    const rule = evaluate({ scores: best.scores, scene: best.scene, degradedNetwork: false, sourceMode: 'satellite' });
     log.emit(
       `best of ${videoResult.framesProcessed} frames: ${rule.action}`,
       rule.priority === 'CRITICAL' ? 'critical' : 'info'
@@ -198,7 +210,13 @@ export default function App() {
       best.sourceImageData,
       best.detectionMask,
       best.detections,
-      { maxLabels: 6, labels: best.detectionLabels, imageW: best.width, imageH: best.height }
+      {
+        maxLabels: 6,
+        labels: best.detectionLabels,
+        imageW: best.width,
+        imageH: best.height,
+        excludeClasses: ['terrain', 'vegetation']
+      }
     );
 
     const includesThumb =
@@ -245,7 +263,8 @@ export default function App() {
       thumbnailDataUrl,
       detectionOverlayUrl,
       framesProcessed: videoResult.framesProcessed,
-      scene: best.scene
+      scene: best.scene,
+      sourceMode: 'satellite'
     });
   }
 
@@ -286,7 +305,7 @@ export default function App() {
             }
             webcamFrameCount.current++;
             const rawBytes = id.width * id.height * 3;
-            await processImageData(id, rawBytes, `webcam #${webcamFrameCount.current}`, true);
+            await processImageData(id, rawBytes, `webcam #${webcamFrameCount.current}`, true, 'webcam');
             setLiveTag(`LIVE WEBCAM · frame ${webcamFrameCount.current}`);
           }
         } catch (e) {
@@ -397,7 +416,7 @@ export default function App() {
   });
 
   const handleUploadImage = wrap(async (url: string) => {
-    await processFromUrl(url, undefined, 'uploaded image');
+    await processFromUrl(url, undefined, 'uploaded image', false, 'upload');
   });
 
   const handleVideo = wrap(async (url: string, isTimelapse: boolean) => {

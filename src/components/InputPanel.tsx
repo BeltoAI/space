@@ -106,28 +106,61 @@ export default function InputPanel({
           <div className="flex items-center gap-2 text-[12px] font-semibold tracking-widest2">
             <span className={`w-2 h-2 rounded-full ${streamActive ? 'bg-critical live-pulse' : 'bg-amber'}`} />
             <span className={streamActive ? '' : 'text-amber'}>
-              {streamActive ? 'STOP STREAMING GOES' : 'STREAM GOES-19'}
+              {streamActive ? 'STOP STREAMING GOES' : 'STREAM GOES-19 LIVE'}
             </span>
           </div>
           <div className="text-[12px] text-muted mt-1 leading-snug font-normal">
-            {streamActive ? 'Polling every 30 sec · NOAA STAR CDN' : 'Continental US · NOAA refreshes every 5 min'}
+            {streamActive ? 'Polling every 30 sec · NOAA STAR CDN' : 'Real-time · NOAA East · Continental US'}
           </div>
         </button>
 
         <Divider />
 
-        <Section label="One-shot tile">
-          <Btn onClick={onGoesOnce} disabled={busy}>Latest GOES-19 frame</Btn>
-          <Btn onClick={onLiveTile} disabled={busy}>Latest EONET event</Btn>
+        <Section label="Real-time NASA / NOAA">
+          <Btn onClick={onGoesOnce} disabled={busy}>
+            <div className="flex flex-col">
+              <span>Latest GOES-19 snapshot</span>
+              <span className="text-[10px] text-muted mt-0.5 leading-tight">Continental US, refreshes every 5 min</span>
+            </div>
+          </Btn>
+          <Btn onClick={onLiveTile} disabled={busy}>
+            <div className="flex flex-col">
+              <span>Latest natural event (EONET)</span>
+              <span className="text-[10px] text-muted mt-0.5 leading-tight">NASA's open event tracker · live wildfires/storms</span>
+            </div>
+          </Btn>
+          <Btn onClick={onTimelapse} disabled={busy}>
+            <div className="flex flex-col">
+              <span>Park Fire timelapse · 6 days</span>
+              <span className="text-[10px] text-muted mt-0.5 leading-tight">Watch decision change as fire evolves</span>
+            </div>
+          </Btn>
         </Section>
 
-        <Section label="Samples">
-          {SAMPLES.map(s => (
-            <Btn key={s.id} onClick={() => onSample(s.id)} disabled={busy}>
-              {s.label}
-            </Btn>
-          ))}
-          <Btn onClick={onTimelapse} disabled={busy}>Park Fire timelapse · 6 days</Btn>
+        <Section label="Historical samples">
+          {SAMPLES.map(s => {
+            const isFireSample = s.id === 'wildfire';
+            return (
+              <button
+                key={s.id}
+                onClick={() => onSample(s.id)}
+                disabled={busy}
+                className={`px-3 py-2 text-left border rounded-md disabled:opacity-40 disabled:cursor-not-allowed transition group ${
+                  isFireSample
+                    ? 'border-critical/40 bg-critical/5 hover:border-critical/70 hover:bg-critical/10'
+                    : 'border-border hover:border-amber/60 hover:bg-amber/5'
+                }`}
+              >
+                <div className={`text-[13px] transition flex items-center gap-1.5 ${
+                  isFireSample ? 'text-critical' : 'group-hover:text-amber'
+                }`}>
+                  {isFireSample && <span className="text-[10px]">🔥</span>}
+                  {s.label}
+                </div>
+                <div className="text-[10px] text-muted mt-0.5 leading-tight">{s.caption}</div>
+              </button>
+            );
+          })}
         </Section>
 
         <Section label="Upload">

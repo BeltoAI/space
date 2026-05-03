@@ -16,11 +16,11 @@ const CLASS_NAMES: Record<number, DetectionClass> = {
 };
 
 const COLORS: Record<DetectionClass, { stroke: string; fill: string; label: string }> = {
-  fire:       { stroke: '#ff3b1c', fill: 'rgba(255, 60, 0, 0.32)',   label: '#fff'    },
-  cloud:      { stroke: '#22d3ee', fill: 'rgba(34, 211, 238, 0.20)', label: '#0a0a0a' },
-  water:      { stroke: '#fbbf24', fill: 'rgba(251, 191, 36, 0.22)', label: '#0a0a0a' },
-  vegetation: { stroke: '#84cc16', fill: 'rgba(132, 204, 22, 0.18)', label: '#0a0a0a' },
-  terrain:    { stroke: '#a78bfa', fill: 'rgba(167, 139, 250, 0.18)', label: '#0a0a0a' }
+  fire:       { stroke: '#ff3b1c', fill: 'rgba(255, 60, 0, 0.18)',   label: '#fff'    },
+  cloud:      { stroke: '#22d3ee', fill: 'rgba(34, 211, 238, 0.10)', label: '#0a0a0a' },
+  water:      { stroke: '#fbbf24', fill: 'rgba(251, 191, 36, 0.10)', label: '#0a0a0a' },
+  vegetation: { stroke: '#84cc16', fill: 'rgba(132, 204, 22, 0.08)', label: '#0a0a0a' },
+  terrain:    { stroke: '#a78bfa', fill: 'rgba(167, 139, 250, 0.08)', label: '#0a0a0a' }
 };
 
 export interface ComponentResult {
@@ -176,6 +176,31 @@ function simplifyContour(points: { x: number; y: number }[], stride: number): { 
   return out;
 }
 
+// Smooth contour points with a simple moving-average filter.
+// Removes the staircase artifacts from pixel-accurate Moore-Neighbor tracing
+// and produces nicer curved outlines for visual presentation.
+function smoothContour(points: { x: number; y: number }[], passes = 2): { x: number; y: number }[] {
+  if (points.length < 5) return points;
+  let cur = points;
+  for (let p = 0; p < passes; p++) {
+    const next: { x: number; y: number }[] = [];
+    const n = cur.length;
+    for (let i = 0; i < n; i++) {
+      // Wrap-around 5-tap average (closed contour)
+      const im2 = (i - 2 + n) % n;
+      const im1 = (i - 1 + n) % n;
+      const ip1 = (i + 1) % n;
+      const ip2 = (i + 2) % n;
+      next.push({
+        x: (cur[im2].x + 2 * cur[im1].x + 3 * cur[i].x + 2 * cur[ip1].x + cur[ip2].x) / 9,
+        y: (cur[im2].y + 2 * cur[im1].y + 3 * cur[i].y + 2 * cur[ip1].y + cur[ip2].y) / 9
+      });
+    }
+    cur = next;
+  }
+  return cur;
+}
+
 interface Contour {
   cls: DetectionClass;
   points: { x: number; y: number }[];
@@ -209,7 +234,7 @@ function findContoursForDetections(
     const stride = pts.length > 800 ? 6 : pts.length > 300 ? 3 : 1;
     out.push({
       cls: d.cls,
-      points: simplifyContour(pts, stride),
+      points: smoothContour(simplifyContour(pts, stride), 2),
       area: d.area
     });
   }
@@ -225,6 +250,10 @@ interface RenderOpts {
   imageW?: number;
   imageH?: number;
   excludeClasses?: DetectionClass[]; // visual filter — don't render these
+  /** Show text labels on contours. Default false — colored outlines are
+   *  unambiguous enough on their own and false labels are cosmetically worse
+   *  than no labels. The legend chips in OutputPanel still show class summary. */
+  showLabels?: boolean;
 }
 
 export async function renderDetectionOverlay(
@@ -238,7 +267,8 @@ export async function renderDetectionOverlay(
     labels,
     imageW = source.width,
     imageH = source.height,
-    excludeClasses = []
+    excludeClasses = [],
+    showLabels = false
   } = opts;
   const W = source.width;
   const H = source.height;
@@ -285,42 +315,44 @@ export async function renderDetectionOverlay(
     ctx.stroke();
   }
 
-  const labelFontSize = Math.max(11, Math.round(W / 70));
-  ctx.font = `600 ${labelFontSize}px -apple-system, "Inter", system-ui, sans-serif`;
-  ctx.textBaseline = 'top';
+  if (showLabels) {
+    const labelFontSize = Math.max(11, Math.round(W / 70));
+    ctx.font = `600 ${labelFontSize}px -apple-system, "Inter", system-ui, sans-serif`;
+    ctx.textBaseline = 'top';
 
-  const placedLabels: { x: number; y: number; w: number; h: number }[] = [];
-  const labelable = filtered.slice(0, maxLabels);
+    const placedLabels: { x: number; y: number; w: number; h: number }[] = [];
+    const labelable = filtered.slice(0, maxLabels);
 
-  for (const d of labelable) {
-    const colors = COLORS[d.cls];
-    const text = d.cls.toUpperCase();
-    const padX = 5;
-    const padY = 3;
-    const tw = ctx.measureText(text).width + padX * 2;
-    const th = labelFontSize + padY * 2;
+    for (const d of labelable) {
+      const colors = COLORS[d.cls];
+      const text = d.cls.toUpperCase();
+      const padX = 5;
+      const padY = 3;
+      const tw = ctx.measureText(text).width + padX * 2;
+      const th = labelFontSize + padY * 2;
 
-    const candidates = [
-      { x: d.x0, y: d.y0 - th - 2 },
-      { x: d.x0, y: d.y1 + 2 },
-      { x: d.x0 + 2, y: d.y0 + 2 }
-    ];
-    let chosen = candidates[0];
-    for (const c of candidates) {
-      const fits =
-        c.x >= 0 && c.x + tw <= W && c.y >= 0 && c.y + th <= H &&
-        !placedLabels.some(p =>
-          c.x < p.x + p.w && c.x + tw > p.x && c.y < p.y + p.h && c.y + th > p.y
-        );
-      if (fits) { chosen = c; break; }
+      const candidates = [
+        { x: d.x0, y: d.y0 - th - 2 },
+        { x: d.x0, y: d.y1 + 2 },
+        { x: d.x0 + 2, y: d.y0 + 2 }
+      ];
+      let chosen = candidates[0];
+      for (const c of candidates) {
+        const fits =
+          c.x >= 0 && c.x + tw <= W && c.y >= 0 && c.y + th <= H &&
+          !placedLabels.some(p =>
+            c.x < p.x + p.w && c.x + tw > p.x && c.y < p.y + p.h && c.y + th > p.y
+          );
+        if (fits) { chosen = c; break; }
+      }
+      placedLabels.push({ x: chosen.x, y: chosen.y, w: tw, h: th });
+
+      roundRect(ctx, chosen.x, chosen.y, tw, th, 3);
+      ctx.fillStyle = colors.stroke;
+      ctx.fill();
+      ctx.fillStyle = colors.label;
+      ctx.fillText(text, chosen.x + padX, chosen.y + padY);
     }
-    placedLabels.push({ x: chosen.x, y: chosen.y, w: tw, h: th });
-
-    roundRect(ctx, chosen.x, chosen.y, tw, th, 3);
-    ctx.fillStyle = colors.stroke;
-    ctx.fill();
-    ctx.fillStyle = colors.label;
-    ctx.fillText(text, chosen.x + padX, chosen.y + padY);
   }
 
   return canvas.toDataURL('image/png');

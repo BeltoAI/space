@@ -117,4 +117,4 @@ Webcam, samples, uploads, and inference all work fully offline. Live GOES stream
 
 ## Versioning
 
-v0.11.0 — real EuroSAT scene classifier integration · scene-driven rule engine
+v0.14.0 — source-aware classification (webcam/satellite/upload have separate rule tracks) · scene-context fire/water rejection · per-pixel fire override

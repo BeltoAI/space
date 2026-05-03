@@ -89,11 +89,11 @@ async function runSequence(
 
   for (let i = 0; i < frames.length; i++) {
     const id = frames[i];
-    const fa = await analyzeFrame(id, prevEmbedding);
+    const fa = await analyzeFrame(id, prevEmbedding, 400, 'satellite');
     results.push(fa);
     prevEmbedding = fa.embedding;
 
-    const rule = evaluate({ scores: fa.scores, degradedNetwork });
+    const rule = evaluate({ scores: fa.scores, scene: fa.scene, degradedNetwork, sourceMode: 'satellite' });
     const rank = priorityRank(fa.scores);
 
     await log.streamed(
