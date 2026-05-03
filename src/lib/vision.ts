@@ -372,6 +372,56 @@ export function spectralAnalysis(imageData: ImageData, sourceMode: SourceMode = 
     }
   }
 
+  // ============================================================
+  // WEBCAM FIRE DETECTION — separate, stricter path
+  //
+  // Real flames have something red household objects don't: an
+  // incandescent white-hot CORE (R>240, G>210, B<170, L>82). A red
+  // phone case or shirt is uniformly red — no white core. Even a red
+  // LED has high B (cool spectrum), so it fails the B<170 check.
+  //
+  // We require three things together:
+  //   1. Bright incandescent core pixels exist (the flame's hot center)
+  //   2. Saturated warm halo pixels exist (the orange flame body)
+  //   3. Both are localized — neither covers >15% of frame
+  //
+  // This catches:  ✓ lighter, candle, campfire, gas stove, fireplace
+  // This rejects:  ✗ red phone, red shirt, tomato, sunset window, LED
+  // ============================================================
+  if (sourceMode === 'webcam') {
+    let coreCount = 0;
+    let haloCount = 0;
+    for (let i = 0; i < N; i++) {
+      const idx = i * 4;
+      const r = data[idx], g = data[idx + 1], b = data[idx + 2];
+      const L = lab[i * 3];
+      const isCore = r > 240 && g > 210 && b < 170 && L > 82;
+      if (isCore) coreCount++;
+      const maxC = Math.max(r, g, b), minC = Math.min(r, g, b);
+      const sat = maxC === 0 ? 0 : (maxC - minC) / maxC;
+      const isHalo = r > 200 && r > g + 50 && r > b + 90 && sat > 0.45;
+      if (isHalo) haloCount++;
+    }
+    const coreFrac = coreCount / N;
+    const haloFrac = haloCount / N;
+    // Real flame: BOTH must exist, neither dominates the frame
+    const hasCore = coreCount >= 4 && coreFrac < 0.10;
+    const hasHalo = haloCount >= 8 && haloFrac < 0.20;
+    if (hasCore && hasHalo) {
+      // Confirmed flame — mark all core+halo pixels as fire
+      for (let i = 0; i < N; i++) {
+        const idx = i * 4;
+        const r = data[idx], g = data[idx + 1], b = data[idx + 2];
+        const L = lab[i * 3];
+        const isCore = r > 240 && g > 210 && b < 170 && L > 82;
+        const maxC = Math.max(r, g, b), minC = Math.min(r, g, b);
+        const sat = maxC === 0 ? 0 : (maxC - minC) / maxC;
+        const isHalo = r > 200 && r > g + 50 && r > b + 90 && sat > 0.45;
+        if (isCore || isHalo) mask[i] = CLASS_FIRE;
+      }
+    }
+  }
+
   // Compute final class areas from the mask (which includes the per-pixel
   // fire override). This is critical: if we computed scores from cluster
   // sizes, the per-pixel fire pixels would be miscounted as their original

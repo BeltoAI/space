@@ -29,14 +29,22 @@ export function evaluate(ctx: RuleContext): RuleResult {
 
   // ============================================================
   // WEBCAM MODE — completely separate decision track.
-  // Webcam frames are NOT satellite tiles. Don't trigger fire response,
-  // flood watch, or cloud-occlusion rules. Instead, route based on the
-  // CNN's anomaly signal (frame-to-frame change) — this is what's
-  // actually impressive in webcam mode: real-time edge inference + change
-  // detection running fully on the laptop.
+  // Routes based on CNN anomaly signal (real-time edge inference) PLUS
+  // strict fire detection (incandescent core + saturated halo + localized).
+  // The vision pipeline already gates webcam fire on co-occurrence of
+  // bright-core + warm-halo, so any nonzero fire score here is a confirmed
+  // flame, not a red object false-positive.
   // ============================================================
   if (sourceMode === 'webcam') {
-    if (scores.anomaly >= 0.35) {
+    if (scores.fire >= 0.005) {
+      result = {
+        rule: 'PRIORITY_FIRE',
+        priority: 'CRITICAL',
+        decision: 'COMPRESSED_DOWNLINK',
+        reason: `incandescent fire signature detected on webcam feed (fire=${scores.fire.toFixed(3)})`,
+        action: 'DOWNLINK NOW · alert fire response'
+      };
+    } else if (scores.anomaly >= 0.35) {
       result = {
         rule: 'EDGE_ANOMALY',
         priority: 'HIGH',
